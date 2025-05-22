@@ -1,11 +1,11 @@
-torch
-numpy
-gymnasium
-opencv-python
-imageio
-imageio-ffmpeg
-wandb
-matplotlib
-tqdm
-gymnasium[atari]
-ale-py autorom
+torch>=2.0.0
+numpy>=1.21.0
+gymnasium[atari]>=0.28.1
+opencv-python>=4.5.5
+imageio>=2.9.0
+imageio-ffmpeg>=0.4.8
+wandb>=0.15.0
+matplotlib>=3.4.0
+tqdm>=4.64.0
+ale-py>=0.8.0
+autorom>=0.6.0

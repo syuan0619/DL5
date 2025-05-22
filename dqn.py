@@ -21,6 +21,7 @@ import argparse
 import wandb
 import imageio
 from typing import Optional, List, Tuple
+import ale_py
 
 class AtariPreprocessor:
     """Atari環境預處理器（灰度化+縮放+幀堆疊）"""
@@ -45,43 +46,112 @@ class AtariPreprocessor:
         self.frames.append(self.preprocess(obs))
         return np.stack(self.frames, axis=0)
 
+class SumTree:
+    """SumTree 是一種特殊的二叉樹結構，用於高效存儲和檢索優先級數據。"""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)  # SumTree 的樹數組
+        self.data = np.zeros(capacity, dtype=object)  # 儲存實際數據
+        self.write = 0  # 當前寫入位置
+
+    def add(self, priority, data):
+        """新增數據到 SumTree 中。"""
+        index = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(index, priority)
+        self.write += 1
+        if self.write >= self.capacity:  # 循環覆蓋
+            self.write = 0
+
+    def update(self, index, priority):
+        """更新樹節點的優先級，並向上更新父節點。"""
+        change = priority - self.tree[index]
+        self.tree[index] = priority
+        while index != 0:  # 向上更新父節點
+            index = (index - 1) // 2
+            self.tree[index] += change
+
+    def get(self, value):
+        """根據優先級值檢索對應的數據。"""
+        parent = 0
+        while True:
+            left = 2 * parent + 1
+            right = left + 1
+            if left >= len(self.tree):  # 到達葉節點
+                leaf = parent
+                break
+            else:
+                if value <= self.tree[left]:
+                    parent = left
+                else:
+                    value -= self.tree[left]
+                    parent = right
+        data_index = leaf - self.capacity + 1
+        return leaf, self.tree[leaf], self.data[data_index]
+
+    def total_priority(self):
+        """返回 SumTree 的總優先級。"""
+        return self.tree[0]
+
+    def __len__(self):
+        return len(self.data)
+
 class PrioritizedReplayBuffer:
     """優先經驗回放（PER）實現"""
-    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4):
+    def __init__(self, capacity: int, alpha: float = 0.6, beta_start: float = 0.4, beta_frames: int = 100000):
+        self.tree = SumTree(capacity)
         self.capacity = capacity
         self.alpha = alpha
-        self.beta = beta
-        self.buffer = []
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.pos = 0
-        self.max_priority = 1.0
+        self.beta = beta_start
+        self.beta_increment_per_sample = (1.0 - beta_start) / beta_frames
+        self.epsilon = 1e-6  # 避免優先級為 0
 
-    def add(self, transition: Tuple) -> None:
+    def add(self, error, sample):
         """添加經驗並初始化優先級"""
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.pos] = transition
-        self.priorities[self.pos] = self.max_priority ** self.alpha
-        self.pos = (self.pos + 1) % self.capacity
+        # 確保 sample 是 tuple 格式
+        if not isinstance(sample, tuple) or len(sample) != 5:
+            raise ValueError("Sample must be a tuple of (state, action, reward, next_state, done)")
+        
+        priority = self._get_priority(error)
+        self.tree.add(priority, sample)
 
-    def sample(self, batch_size: int) -> Tuple[List, np.ndarray, np.ndarray]:
-        """根據優先級採樣"""
-        if len(self.buffer) == 0:
-            return [], [], []
+    def _get_priority(self, error):
+        """根據 TD 誤差計算優先級"""
+        return (np.abs(error) + self.epsilon) ** self.alpha
 
-        probs = self.priorities[:len(self.buffer)] / self.priorities[:len(self.buffer)].sum()
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-        samples = [self.buffer[i] for i in indices]
-        weights = (len(self.buffer) * probs[indices]) ** (-self.beta)
-        weights /= weights.max()
-        return samples, indices, weights
+    def sample(self, batch_size):
+        """從緩衝區中採樣一個批次"""
+        batch = []
+        idxs = []
+        priorities = []
+        segment = self.tree.total_priority() / batch_size
 
-    def update_priorities(self, indices: List[int], errors: np.ndarray) -> None:
-        """更新採樣經驗的優先級"""
-        for idx, error in zip(indices, errors):
-            self.priorities[idx] = (abs(error) + 1e-5) ** self.alpha
-            self.max_priority = max(self.max_priority, self.priorities[idx])
+        for i in range(batch_size):
+            a = segment * i
+            b = segment * (i + 1)
+            value = random.uniform(a, b)
+            index, priority, data = self.tree.get(value)
+            batch.append(data)
+            idxs.append(index)
+            priorities.append(priority)
+
+        sampling_probabilities = priorities / self.tree.total_priority()
+        is_weights = np.power(self.tree.capacity * sampling_probabilities, -self.beta)
+        is_weights /= is_weights.max()
+
+        # 動態增加 beta 值
+        self.beta = min(1.0, self.beta + self.beta_increment_per_sample)
+
+        return batch, idxs, is_weights
+
+    def update(self, idx, error):
+        """更新給定索引的優先級"""
+        priority = self._get_priority(error)
+        self.tree.update(idx, priority)
+
+    def __len__(self):
+        """返回緩衝區中存儲的經驗數量"""
+        return len(self.tree.data)
 
 class DQNNetwork(nn.Module):
     """支援多種輸入的DQN網路架構"""
@@ -121,7 +191,7 @@ class DQNAgent:
     def __init__(self, env_name: str, args: argparse.Namespace):
         # 環境初始化
         self.env = gym.make(env_name)
-        self.test_env = gym.make(env_name, render_mode="rgb_array", width=1280, height=720) if args.record_video else None
+        self.test_env = gym.make(env_name, render_mode="rgb_array") if args.record_video else None
         self.num_actions = self.env.action_space.n
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -195,7 +265,7 @@ class DQNAgent:
 
         # 更新優先級
         if isinstance(self.memory, PrioritizedReplayBuffer):
-            self.memory.update_priorities(indices, td_errors.cpu().detach().numpy())
+            self.memory.update(indices, td_errors.cpu().detach().numpy())
 
         # 優化
         loss = (weights * td_errors.pow(2)).mean()
@@ -216,6 +286,10 @@ class DQNAgent:
         state, _ = self.env.reset()
         if self.preprocessor:
             state = self.preprocessor.reset(state)
+
+        # 渲染模式需要初始化測試環境
+        if render and self.test_env:
+            self.test_env.reset()
 
         episode_reward = 0
         n_step_buffer = deque(maxlen=self.n_steps)
@@ -238,7 +312,7 @@ class DQNAgent:
                 states, acts, rews, next_states, dones = zip(*n_step_buffer)
                 transition = (states[0], acts[0], sum(rews), next_states[-1], dones[-1])
                 if isinstance(self.memory, PrioritizedReplayBuffer):
-                    self.memory.add(transition)
+                    self.memory.add(sum(rews), transition)
                 else:
                     self.memory.append(transition)
 
@@ -262,7 +336,7 @@ class DQNAgent:
             self.epsilon *= self.epsilon_decay
 
         return episode_reward, frames
-
+    
     def evaluate(self, num_episodes: int = 3) -> None:
         """評估模型表現"""
         if not self.test_env:
